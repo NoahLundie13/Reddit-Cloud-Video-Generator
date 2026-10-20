@@ -1,0 +1,97 @@
+name: Generate Reddit videos
+
+on:
+  workflow_dispatch:
+    inputs:
+      videos:
+        description: Number of videos to generate in this run (1–5)
+        required: true
+        type: choice
+        options:
+          - "1"
+          - "2"
+          - "3"
+          - "4"
+          - "5"
+        default: "1"
+  schedule:
+    # Daily at 18:17 UTC. GitHub scheduled jobs can start late during busy periods.
+    - cron: "17 18 * * *"
+
+permissions:
+  contents: write
+
+concurrency:
+  group: reddit-video-generation
+  cancel-in-progress: false
+
+jobs:
+  generate:
+    runs-on: ubuntu-latest
+    timeout-minutes: 350
+    env:
+      TTS_API_KEY: ${{ secrets.TTS_API_KEY }}
+      GAMEPLAY_VIDEO_URL: ${{ secrets.GAMEPLAY_VIDEO_URL }}
+      WHISPER_MODEL: base.en
+      PYTHONUNBUFFERED: "1"
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+
+      - name: Check required secrets
+        shell: bash
+        run: |
+          test -n "$TTS_API_KEY" || { echo "Missing repository secret TTS_API_KEY"; exit 1; }
+          test -n "$GAMEPLAY_VIDEO_URL" || { echo "Missing repository secret GAMEPLAY_VIDEO_URL"; exit 1; }
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+          cache: pip
+
+      - name: Install FFmpeg and Python dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y ffmpeg
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt
+
+      - name: Download gameplay footage
+        shell: bash
+        run: |
+          curl --fail --location --retry 3 --retry-delay 2 \
+            "$GAMEPLAY_VIDEO_URL" \
+            --output utils/gameplay.mp4
+          test -s utils/gameplay.mp4 || { echo "Downloaded gameplay file is empty"; exit 1; }
+          ffprobe -v error -show_entries format=duration -of default=noprint_wrappers=1:nokey=1 utils/gameplay.mp4
+
+      - name: Generate videos
+        shell: bash
+        env:
+          VIDEOS_TO_GENERATE: ${{ github.event.inputs.videos || '1' }}
+        run: |
+          for ((i=1; i<=VIDEOS_TO_GENERATE; i++)); do
+            echo "Generating video $i of $VIDEOS_TO_GENERATE"
+            python main.py
+          done
+
+      - name: Upload generated MP4 files
+        uses: actions/upload-artifact@v4
+        with:
+          name: reddit-videos-${{ github.run_number }}
+          path: Stories/**/*.mp4
+          if-no-files-found: error
+          retention-days: 14
+          compression-level: 0
+
+      - name: Persist story counter
+        if: success()
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add utils/counter.txt
+          if ! git diff --cached --quiet; then
+            git commit -m "Update generated story counter [skip ci]"
+            git push
+          fi
